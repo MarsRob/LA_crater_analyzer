@@ -2,8 +2,6 @@
 setlocal
 
 set PYTHON=python
-set SPYDER_PYTHON=%LOCALAPPDATA%\spyder-6\envs\spyder-runtime\python.exe
-if exist "%SPYDER_PYTHON%" set PYTHON="%SPYDER_PYTHON%"
 if not "%~1"=="" set PYTHON=%~1
 
 %PYTHON% -m venv .venv
