@@ -1,22 +1,25 @@
 from __future__ import annotations
 
+import copy
 import csv
 import sys
 from pathlib import Path
 
 import cv2
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -26,6 +29,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QToolBar,
@@ -52,6 +56,7 @@ class VideoCanvas(QWidget):
         self._outer: tuple[tuple[float, float], tuple[float, float]] | None = None
         self._pending: tuple[float, float] | None = None
         self._label: str = ""
+        self._instruction: str = ""
         self._zoom_enabled = False
         self._zoom_focus: tuple[float, float] | None = None
         self._zoom_size = 260
@@ -73,6 +78,7 @@ class VideoCanvas(QWidget):
         outer: tuple[tuple[float, float], tuple[float, float]] | None,
         pending: tuple[float, float] | None,
         label: str = "",
+        instruction: str = "",
     ) -> None:
         self._expected = expected
         self._center = center
@@ -80,6 +86,7 @@ class VideoCanvas(QWidget):
         self._outer = outer
         self._pending = pending
         self._label = label
+        self._instruction = instruction
         self.update()
 
     def set_zoom(
@@ -105,6 +112,7 @@ class VideoCanvas(QWidget):
         source_rect = self._source_rect()
         painter.drawPixmap(image_rect.toRect(), self._pixmap, source_rect.toRect())
         self._draw_overlays(painter, image_rect)
+        self._draw_instruction(painter, image_rect)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() != Qt.MouseButton.LeftButton:
@@ -168,6 +176,7 @@ class VideoCanvas(QWidget):
     ) -> None:
         mapped = self._image_to_widget(point, rect)
         painter.setPen(QPen(QColor(color), 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawLine(QPointF(mapped.x() - radius, mapped.y()), QPointF(mapped.x() + radius, mapped.y()))
         painter.drawLine(QPointF(mapped.x(), mapped.y() - radius), QPointF(mapped.x(), mapped.y() + radius))
         painter.drawEllipse(mapped, radius, radius)
@@ -186,6 +195,7 @@ class VideoCanvas(QWidget):
         center = QPointF((a.x() + b.x()) / 2.0, (a.y() + b.y()) / 2.0)
         radius = ((a.x() - b.x()) ** 2 + (a.y() - b.y()) ** 2) ** 0.5 / 2.0
         painter.setPen(QPen(QColor(color), 3))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawEllipse(center, radius, radius)
         painter.drawLine(a, b)
         painter.drawEllipse(a, 4, 4)
@@ -221,6 +231,117 @@ class VideoCanvas(QWidget):
         painter.drawRoundedRect(label_rect, 4, 4)
         painter.setPen(QPen(QColor(color), 2))
         painter.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, text)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    def _draw_instruction(self, painter: QPainter, rect: QRectF) -> None:
+        if not self._instruction:
+            return
+        width = min(rect.width() - 24, 760)
+        label_rect = QRectF(rect.left() + 12, rect.top() + 12, width, 34)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(17, 19, 24, 220))
+        painter.drawRoundedRect(label_rect, 5, 5)
+        painter.setPen(QPen(QColor("#e6e8ee"), 1))
+        painter.drawText(label_rect.adjusted(12, 0, -12, 0), Qt.AlignmentFlag.AlignVCenter, self._instruction)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+
+class AnalysisResultsDialog(QDialog):
+    def __init__(self, csv_path: Path, output_dir: Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.csv_path = csv_path
+        self.output_dir = output_dir
+        self.current_pixmap: QPixmap | None = None
+        self.files = [
+            path
+            for path in sorted(output_dir.iterdir())
+            if path.suffix.lower() in {".png", ".csv"}
+        ]
+
+        self.setWindowFlags(
+            self.windowFlags()
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
+        )
+        self.setWindowTitle("CSV Analysis Results")
+        self.resize(980, 700)
+
+        layout = QVBoxLayout(self)
+        title = QLabel(f"Analysis: {csv_path.name}")
+        title.setObjectName("workflowTitle")
+        layout.addWidget(title)
+
+        body = QHBoxLayout()
+        self.file_list = QListWidget()
+        self.file_list.setMinimumWidth(290)
+        for path in self.files:
+            self.file_list.addItem(path.name)
+        body.addWidget(self.file_list)
+
+        self.preview_stack = QStackedWidget()
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_scroll = QScrollArea()
+        self.image_scroll.setWidget(self.image_label)
+        self.image_scroll.setWidgetResizable(True)
+        self.text_preview = QPlainTextEdit()
+        self.text_preview.setReadOnly(True)
+        self.preview_stack.addWidget(self.image_scroll)
+        self.preview_stack.addWidget(self.text_preview)
+        body.addWidget(self.preview_stack, 1)
+        layout.addLayout(body, 1)
+
+        footer = QHBoxLayout()
+        self.output_label = QLabel(f"Output folder: {output_dir}")
+        self.close_button = QPushButton("Close")
+        self.close_button.clicked.connect(self.accept)
+        footer.addWidget(self.output_label, 1)
+        footer.addWidget(self.close_button)
+        layout.addLayout(footer)
+
+        self.file_list.currentRowChanged.connect(self.show_file)
+        if self.files:
+            self.file_list.setCurrentRow(0)
+        else:
+            self.text_preview.setPlainText("No analysis output files were found.")
+            self.preview_stack.setCurrentWidget(self.text_preview)
+
+    def show_file(self, row: int) -> None:
+        if row < 0 or row >= len(self.files):
+            return
+        path = self.files[row]
+        if path.suffix.lower() == ".png":
+            self.current_pixmap = QPixmap(str(path))
+            self.preview_stack.setCurrentWidget(self.image_scroll)
+            self._update_scaled_image()
+            return
+
+        self.current_pixmap = None
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except OSError as exc:
+            text = str(exc)
+        self.text_preview.setPlainText(text)
+        self.preview_stack.setCurrentWidget(self.text_preview)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if self.preview_stack.currentWidget() == self.image_scroll:
+            self._update_scaled_image()
+
+    def _update_scaled_image(self) -> None:
+        if self.current_pixmap is None or self.current_pixmap.isNull():
+            self.image_label.clear()
+            return
+        available = self.image_scroll.viewport().size()
+        if available.width() <= 1 or available.height() <= 1:
+            return
+        scaled = self.current_pixmap.scaled(
+            available,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.image_label.setPixmap(scaled)
 
 
 class MainWindow(QMainWindow):
@@ -239,6 +360,15 @@ class MainWindow(QMainWindow):
         self.scan_position_override: tuple[float, float] | None = None
         self.armed_target: str | None = None
         self.shortcuts: list[QShortcut] = []
+        self.undo_stack: list[dict[str, object]] = []
+        self.redo_stack: list[dict[str, object]] = []
+        self.last_csv_path: Path | None = None
+        self.csv_needs_export = False
+        self.review_pause_ms = 1200
+        self.review_pause_record_index: int | None = None
+        self.review_pause_timer = QTimer(self)
+        self.review_pause_timer.setSingleShot(True)
+        self.review_pause_timer.timeout.connect(self.finish_review_pause)
         self.workflow_step = "presence"
         self._updating_controls = False
 
@@ -248,7 +378,8 @@ class MainWindow(QMainWindow):
         self._build_actions()
         self._build_layout()
         self._connect_signals()
-        self._ensure_records(1)
+        self._ensure_records(self.total_spin.value())
+        self.current_spin.setRange(1, self.total_spin.value())
         self._sync_all()
 
     def _build_actions(self) -> None:
@@ -267,6 +398,15 @@ class MainWindow(QMainWindow):
         self.import_action = QAction("Import CSV", self)
         self.import_action.triggered.connect(self.import_csv)
         toolbar.addAction(self.import_action)
+
+        self.analyze_action = QAction("Analyze Last CSV", self)
+        self.analyze_action.triggered.connect(self.analyze_latest_csv)
+        toolbar.addAction(self.analyze_action)
+
+        toolbar.addSeparator()
+        self.unsaved_label = QLabel("Saved")
+        self.unsaved_label.setObjectName("unsavedLabel")
+        toolbar.addWidget(self.unsaved_label)
 
     def _build_layout(self) -> None:
         root = QWidget()
@@ -287,8 +427,8 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout(right_content)
         right_layout.addWidget(self._build_project_panel())
         right_layout.addWidget(self._build_workflow_panel())
-        right_layout.addWidget(self._build_annotation_panel())
         right_layout.addWidget(self._build_display_panel())
+        right_layout.addWidget(self._build_annotation_panel())
         right_layout.addWidget(self._build_assist_panel())
         right_layout.addWidget(self._build_table())
         right_layout.addStretch(1)
@@ -348,32 +488,34 @@ class MainWindow(QMainWindow):
 
         self.total_spin = QSpinBox()
         self.total_spin.setRange(1, 100000)
-        self.total_spin.setValue(1)
+        self.total_spin.setValue(400)
         self.current_spin = QSpinBox()
-        self.current_spin.setRange(1, 1)
+        self.current_spin.setRange(1, 400)
         self.current_spin.setValue(1)
 
         layout.addWidget(QLabel("Known total"), 0, 0)
         layout.addWidget(self.total_spin, 0, 1)
+        self.apply_total_button = QPushButton("Apply Total")
+        layout.addWidget(self.apply_total_button, 0, 2)
         layout.addWidget(QLabel("Current crater"), 1, 0)
-        layout.addWidget(self.current_spin, 1, 1)
+        layout.addWidget(self.current_spin, 1, 1, 1, 2)
 
         self.go_expected_button = QPushButton("Go Expected Frame")
         self.go_expected_button.setText("Go Suggested Frame")
-        layout.addWidget(self.go_expected_button, 2, 0, 1, 2)
+        layout.addWidget(self.go_expected_button, 2, 0, 1, 3)
         self.summary_label = QLabel("Visible 0 | Missing 0 | Unreviewed 1")
-        layout.addWidget(self.summary_label, 3, 0, 1, 2)
+        layout.addWidget(self.summary_label, 3, 0, 1, 3)
         self.calibration_label = QLabel("Prediction starts after 3 visible centers")
-        layout.addWidget(self.calibration_label, 4, 0, 1, 2)
+        layout.addWidget(self.calibration_label, 4, 0, 1, 3)
         self.scan_position_label = QLabel("Scan position: not calibrated")
-        layout.addWidget(self.scan_position_label, 5, 0, 1, 2)
+        layout.addWidget(self.scan_position_label, 5, 0, 1, 3)
         self.set_scan_position_button = QPushButton("Use Current Center as Scan Position")
-        layout.addWidget(self.set_scan_position_button, 6, 0, 1, 2)
+        layout.addWidget(self.set_scan_position_button, 6, 0, 1, 3)
         self.follow_predictions_check = QCheckBox("Follow predicted crater while scrubbing")
         self.show_suggestions_check = QCheckBox("Show prediction overlays")
         self.show_suggestions_check.setChecked(True)
-        layout.addWidget(self.follow_predictions_check, 7, 0, 1, 2)
-        layout.addWidget(self.show_suggestions_check, 8, 0, 1, 2)
+        layout.addWidget(self.follow_predictions_check, 7, 0, 1, 3)
+        layout.addWidget(self.show_suggestions_check, 8, 0, 1, 3)
         return box
 
     def _build_workflow_panel(self) -> QGroupBox:
@@ -388,37 +530,63 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.workflow_title)
         layout.addWidget(self.workflow_instruction)
 
+        steps_row = QHBoxLayout()
+        self.step_blocks: dict[str, QLabel] = {}
+        for key, label in (
+            ("presence", "1 Inner"),
+            ("rim", "2 Rim?"),
+            ("inner", "3 Finish inner"),
+            ("outer", "4 Outer if rim"),
+        ):
+            block = QLabel(label)
+            block.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            block.setMinimumHeight(34)
+            block.setObjectName("workflowStepBlock")
+            self.step_blocks[key] = block
+            steps_row.addWidget(block, 1)
+        layout.addLayout(steps_row)
+
         self.presence_actions_label = QLabel("Presence")
         presence_row = QHBoxLayout()
-        self.present_button = QPushButton("Mark Present")
+        self.present_button = QPushButton("Use Existing Center")
         self.absent_button = QPushButton("Mark Missing")
         layout.addWidget(self.presence_actions_label)
         presence_row.addWidget(self.present_button)
         presence_row.addWidget(self.absent_button)
         layout.addLayout(presence_row)
 
-        self.tool_actions_label = QLabel("Click Target")
-        tool_row = QHBoxLayout()
-        self.arm_center_button = QPushButton("Arm Center")
-        self.arm_inner_button = QPushButton("Arm Inner Circle")
-        self.arm_outer_button = QPushButton("Arm Outer Circle")
-        layout.addWidget(self.tool_actions_label)
-        tool_row.addWidget(self.arm_center_button)
-        tool_row.addWidget(self.arm_inner_button)
-        tool_row.addWidget(self.arm_outer_button)
-        layout.addLayout(tool_row)
-
-        self.rim_actions_label = QLabel("Rim")
+        self.rim_actions_label = QLabel("Rim exception")
         rim_row = QHBoxLayout()
-        self.no_rim_button = QPushButton("Set No Rim")
-        self.yes_rim_button = QPushButton("Set Rim Present")
+        self.no_rim_button = QPushButton("Clear Rim")
+        self.yes_rim_button = QPushButton("Rim Present")
         layout.addWidget(self.rim_actions_label)
         rim_row.addWidget(self.no_rim_button)
         rim_row.addWidget(self.yes_rim_button)
         layout.addLayout(rim_row)
 
-        self.continue_button = QPushButton("Continue")
-        layout.addWidget(self.continue_button)
+        self.history_actions_label = QLabel("History")
+        history_row = QHBoxLayout()
+        self.workflow_undo_button = QPushButton("Undo Last")
+        self.workflow_redo_button = QPushButton("Redo")
+        self.cancel_measure_button = QPushButton("Cancel Current Measurement")
+        layout.addWidget(self.history_actions_label)
+        history_row.addWidget(self.workflow_undo_button)
+        history_row.addWidget(self.workflow_redo_button)
+        layout.addLayout(history_row)
+        layout.addWidget(self.cancel_measure_button)
+
+        self.tool_actions_label = QLabel("Manual override")
+        self.unlock_tools_check = QCheckBox("Unlock manual override tools")
+        tool_row = QHBoxLayout()
+        self.arm_center_button = QPushButton("Center")
+        self.arm_inner_button = QPushButton("Inner Circle")
+        self.arm_outer_button = QPushButton("Outer Circle")
+        layout.addWidget(self.tool_actions_label)
+        layout.addWidget(self.unlock_tools_check)
+        tool_row.addWidget(self.arm_center_button)
+        tool_row.addWidget(self.arm_inner_button)
+        tool_row.addWidget(self.arm_outer_button)
+        layout.addLayout(tool_row)
         return box
 
     def _build_annotation_panel(self) -> QGroupBox:
@@ -435,8 +603,6 @@ class MainWindow(QMainWindow):
         mode_row.addWidget(self.mode_outer)
         layout.addWidget(QLabel("Manual click target"), 0, 0, 1, 2)
         layout.addLayout(mode_row, 1, 0, 1, 2)
-        self.unlock_tools_check = QCheckBox("Unlock tools for manual override")
-        layout.addWidget(self.unlock_tools_check, 2, 0, 1, 2)
 
         self.visible_check = QCheckBox("Visible")
         self.missing_check = QCheckBox("Missing")
@@ -475,7 +641,7 @@ class MainWindow(QMainWindow):
         self.zoom_size_spin = QSpinBox()
         self.zoom_size_spin.setRange(80, 900)
         self.zoom_size_spin.setSingleStep(20)
-        self.zoom_size_spin.setValue(260)
+        self.zoom_size_spin.setValue(500)
 
         layout.addWidget(QLabel("Brightness"), 0, 0)
         layout.addWidget(self.brightness_slider, 0, 1)
@@ -518,7 +684,8 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self) -> None:
         self.frame_slider.valueChanged.connect(self.set_frame_index)
-        self.total_spin.valueChanged.connect(self.on_total_changed)
+        self.total_spin.valueChanged.connect(self._sync_total_apply_button)
+        self.apply_total_button.clicked.connect(self.apply_total_changed)
         self.current_spin.valueChanged.connect(self.set_current_index)
         self.prev_button.clicked.connect(lambda: self.step_crater(-1))
         self.next_button.clicked.connect(lambda: self.step_crater(1))
@@ -535,12 +702,14 @@ class MainWindow(QMainWindow):
         self.forward_100_button.clicked.connect(lambda: self.nudge_frame(100))
         self.present_button.clicked.connect(self.mark_present_from_workflow)
         self.absent_button.clicked.connect(self.mark_missing_from_workflow)
+        self.workflow_undo_button.clicked.connect(self.undo_last)
+        self.workflow_redo_button.clicked.connect(self.redo_last)
+        self.cancel_measure_button.clicked.connect(self.cancel_current_measurement)
         self.arm_center_button.clicked.connect(lambda: self.arm_click_target("center"))
         self.arm_inner_button.clicked.connect(lambda: self.arm_click_target("inner"))
         self.arm_outer_button.clicked.connect(lambda: self.arm_click_target("outer"))
         self.no_rim_button.clicked.connect(lambda: self.set_rim_from_workflow(False))
         self.yes_rim_button.clicked.connect(lambda: self.set_rim_from_workflow(True))
-        self.continue_button.clicked.connect(self.continue_workflow)
         self.detect_current_button.clicked.connect(self.detect_current)
         self.detect_all_button.clicked.connect(self.detect_unreviewed)
         self.unlock_tools_check.toggled.connect(self._sync_all)
@@ -563,9 +732,38 @@ class MainWindow(QMainWindow):
         next_shortcut.activated.connect(lambda: self.step_crater(1))
         visible_shortcut = QShortcut(QKeySequence("Space"), self)
         visible_shortcut.activated.connect(self.toggle_visible)
-        self.shortcuts.extend([previous_shortcut, next_shortcut, visible_shortcut])
+        undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)
+        undo_shortcut.activated.connect(self.undo_last)
+        redo_shortcut = QShortcut(QKeySequence("Ctrl+Y"), self)
+        redo_shortcut.activated.connect(self.redo_last)
+        missing_shortcut = QShortcut(QKeySequence("M"), self)
+        missing_shortcut.activated.connect(self.shortcut_mark_missing)
+        rim_shortcut = QShortcut(QKeySequence("R"), self)
+        rim_shortcut.activated.connect(self.shortcut_toggle_rim)
+        undo_key_shortcut = QShortcut(QKeySequence("U"), self)
+        undo_key_shortcut.activated.connect(self.shortcut_undo)
+        redo_key_shortcut = QShortcut(QKeySequence("Y"), self)
+        redo_key_shortcut.activated.connect(self.shortcut_redo)
+        cancel_shortcut = QShortcut(QKeySequence("Esc"), self)
+        cancel_shortcut.activated.connect(self.cancel_current_measurement)
+        self.shortcuts.extend(
+            [
+                previous_shortcut,
+                next_shortcut,
+                visible_shortcut,
+                undo_shortcut,
+                redo_shortcut,
+                missing_shortcut,
+                rim_shortcut,
+                undo_key_shortcut,
+                redo_key_shortcut,
+                cancel_shortcut,
+            ]
+        )
 
     def open_video(self) -> None:
+        if not self._confirm_continue_with_unsaved_changes("Open a new video?"):
+            return
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Open crater scan video",
@@ -575,6 +773,28 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self._load_video(path, reset_records=True)
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        if self._confirm_continue_with_unsaved_changes("Close LA Crater Analyzer?"):
+            event.accept()
+        else:
+            event.ignore()
+
+    def _confirm_continue_with_unsaved_changes(self, title: str) -> bool:
+        if not self.csv_needs_export:
+            return True
+        answer = QMessageBox.question(
+            self,
+            title,
+            "There are unsaved crater edits. Export the current CSV before continuing?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer == QMessageBox.StandardButton.Cancel:
+            return False
+        if answer == QMessageBox.StandardButton.No:
+            return True
+        return self.export_csv() is not None
 
     def _load_video(self, path: str | Path, reset_records: bool) -> bool:
         try:
@@ -587,6 +807,10 @@ class MainWindow(QMainWindow):
         self.frame_spin.setRange(1, max(1, info.frame_count))
         self.frame_index = 0
         if reset_records:
+            self.undo_stack.clear()
+            self.redo_stack.clear()
+            self.last_csv_path = None
+            self.csv_needs_export = False
             self.records = [CraterRecord(index=index) for index in range(1, self.total_spin.value() + 1)]
             self.current_index = 1
             self.current_spin.blockSignals(True)
@@ -668,19 +892,75 @@ class MainWindow(QMainWindow):
             self.frame_spin.blockSignals(False)
         self._update_overlay()
 
-    def on_total_changed(self, total: int) -> None:
+    def _sync_total_apply_button(self) -> None:
+        pending_total = self.total_spin.value()
+        applied_total = len(self.records)
+        self.apply_total_button.setEnabled(pending_total != applied_total)
+        if pending_total == applied_total:
+            self.apply_total_button.setText("Apply Total")
+        elif pending_total > applied_total:
+            self.apply_total_button.setText(f"Add {pending_total - applied_total}")
+        else:
+            self.apply_total_button.setText(f"Remove {applied_total - pending_total}")
+
+    def apply_total_changed(self) -> None:
+        total = self.total_spin.value()
+        old_total = len(self.records)
+        if total == old_total:
+            self._sync_total_apply_button()
+            return
+        if total < old_total and self._total_change_would_discard_data(total):
+            answer = QMessageBox.warning(
+                self,
+                "Reduce known total?",
+                (
+                    f"Reducing the known total from {old_total} to {total} will remove "
+                    f"{old_total - total} crater record(s). Some of those records contain "
+                    "review data or measurements.\n\nContinue?"
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self.total_spin.blockSignals(True)
+                self.total_spin.setValue(old_total)
+                self.total_spin.blockSignals(False)
+                self._sync_total_apply_button()
+                return
+        self._push_undo()
         self._ensure_records(total)
         self.current_spin.setRange(1, total)
         self.current_index = min(self.current_index, total)
         self.current_spin.setValue(self.current_index)
         self.recalculate_expected_positions()
+        self._sync_total_apply_button()
         self._sync_all()
 
     def _ensure_records(self, total: int) -> None:
         existing = {record.index: record for record in self.records}
         self.records = [existing.get(index, CraterRecord(index=index)) for index in range(1, total + 1)]
 
+    def _total_change_would_discard_data(self, total: int) -> bool:
+        return any(self._record_has_review_data(record) for record in self.records[total:])
+
+    def _record_has_review_data(self, record: CraterRecord) -> bool:
+        return (
+            record.visible
+            or record.missing
+            or record.center_point() is not None
+            or record.inner_a is not None
+            or record.inner_b is not None
+            or record.outer_a is not None
+            or record.outer_b is not None
+            or record.rim_present is not None
+            or record.measurement_frame is not None
+            or record.auto_score is not None
+            or bool(record.flags)
+            or bool(record.notes.strip())
+        )
+
     def set_current_index(self, index: int) -> None:
+        self._cancel_review_pause_timer()
         self.current_index = index
         self.pending_point = None
         self.armed_target = None
@@ -689,6 +969,95 @@ class MainWindow(QMainWindow):
 
     def current_record(self) -> CraterRecord:
         return self.records[self.current_index - 1]
+
+    def _derive_center_from_inner(self, record: CraterRecord) -> None:
+        if record.center_point() is not None or record.inner_a is None or record.inner_b is None:
+            return
+        frame = record.measurement_frame if record.measurement_frame is not None else self.frame_index
+        record.set_center(
+            (
+                (record.inner_a[0] + record.inner_b[0]) / 2.0,
+                (record.inner_a[1] + record.inner_b[1]) / 2.0,
+            ),
+            frame,
+        )
+
+    def _snapshot(self) -> dict[str, object]:
+        return {
+            "records": copy.deepcopy(self.records),
+            "current_index": self.current_index,
+            "frame_index": self.frame_index,
+            "pending_point": self.pending_point,
+            "last_click": self.last_click,
+            "last_click_frame": self.last_click_frame,
+            "scan_position_override": self.scan_position_override,
+            "armed_target": self.armed_target,
+            "workflow_step": self.workflow_step,
+        }
+
+    def _restore_snapshot(self, snapshot: dict[str, object]) -> None:
+        self.records = copy.deepcopy(snapshot["records"])
+        self.current_index = int(snapshot["current_index"])
+        self.frame_index = int(snapshot["frame_index"])
+        self.pending_point = snapshot["pending_point"]  # type: ignore[assignment]
+        self.last_click = snapshot["last_click"]  # type: ignore[assignment]
+        self.last_click_frame = snapshot["last_click_frame"]  # type: ignore[assignment]
+        self.scan_position_override = snapshot["scan_position_override"]  # type: ignore[assignment]
+        self.armed_target = snapshot["armed_target"]  # type: ignore[assignment]
+        self.workflow_step = str(snapshot["workflow_step"])
+        self.total_spin.blockSignals(True)
+        self.total_spin.setValue(len(self.records))
+        self.total_spin.blockSignals(False)
+        self.current_spin.setRange(1, len(self.records))
+        self.current_spin.blockSignals(True)
+        self.current_spin.setValue(self.current_index)
+        self.current_spin.blockSignals(False)
+        self.refresh_frame()
+        self._sync_all()
+
+    def _push_undo(self) -> None:
+        self.csv_needs_export = True
+        self.undo_stack.append(self._snapshot())
+        if len(self.undo_stack) > 200:
+            self.undo_stack.pop(0)
+        self.redo_stack.clear()
+        self._sync_undo_redo_actions()
+
+    def undo_last(self) -> None:
+        if not self.undo_stack:
+            return
+        self._cancel_review_pause_timer()
+        self.redo_stack.append(self._snapshot())
+        self._restore_snapshot(self.undo_stack.pop())
+        self.csv_needs_export = True
+        self.status.setText("Undid last crater edit")
+
+    def redo_last(self) -> None:
+        if not self.redo_stack:
+            return
+        self._cancel_review_pause_timer()
+        self.undo_stack.append(self._snapshot())
+        self._restore_snapshot(self.redo_stack.pop())
+        self.csv_needs_export = True
+        self.status.setText("Redid crater edit")
+
+    def cancel_current_measurement(self) -> None:
+        if self.pending_point is None:
+            self.status.setText("No in-progress measurement to cancel")
+            return
+        self.pending_point = None
+        self.status.setText("Current measurement cancelled")
+        self._sync_all()
+
+    def _sync_undo_redo_actions(self) -> None:
+        can_undo = bool(self.undo_stack)
+        can_redo = bool(self.redo_stack)
+        if hasattr(self, "workflow_undo_button"):
+            self.workflow_undo_button.setEnabled(can_undo)
+        if hasattr(self, "workflow_redo_button"):
+            self.workflow_redo_button.setEnabled(can_redo)
+        if hasattr(self, "cancel_measure_button"):
+            self.cancel_measure_button.setEnabled(self.pending_point is not None)
 
     def step_crater(self, direction: int) -> None:
         target = max(1, min(len(self.records), self.current_index + direction))
@@ -703,41 +1072,48 @@ class MainWindow(QMainWindow):
 
     def on_canvas_clicked(self, x: float, y: float) -> None:
         if not self._click_target_matches_step():
-            self.status.setText("Arm the click target requested by Guided Review before clicking the image.")
+            self.status.setText("The current guided step does not use an image click.")
             return
         point = (x, y)
+        self._push_undo()
         self.last_click = point
         self.last_click_frame = self.frame_index
         record = self.current_record()
         if self.mode_center.isChecked():
             record.set_center(point, self.frame_index)
+            record.rim_present = False
+            record.outer_a = None
+            record.outer_b = None
             self.pending_point = None
             self.armed_target = None
             self.recalculate_expected_positions()
-            if self.workflow_step == "center":
-                self.workflow_step = "rim"
+            if self.workflow_step in {"presence", "center"}:
+                self.workflow_step = "inner"
             self.status.setText(f"Crater {record.index}: center set at {x:.1f}, {y:.1f}")
         elif self.mode_inner.isChecked():
             saved = self._capture_measurement(record, point, "inner")
-            if saved and self.workflow_step == "inner":
+            if saved and self.workflow_step in {"presence", "center", "inner"}:
                 self.armed_target = None
-                self.workflow_step = "outer" if record.rim_present else "comment"
+                if record.rim_present:
+                    self.workflow_step = "outer"
+                else:
+                    self._begin_review_pause()
+                    return
         elif self.mode_outer.isChecked():
             saved = self._capture_measurement(record, point, "outer")
             if saved and self.workflow_step == "outer":
                 self.armed_target = None
-                self.workflow_step = "comment"
+                self._begin_review_pause()
+                return
         self._sync_all()
 
     def _click_target_matches_step(self) -> bool:
         if self.unlock_tools_check.isChecked():
             return True
-        if self.workflow_step == "center":
-            return self.armed_target == "center" and self.mode_center.isChecked()
-        if self.workflow_step == "inner":
-            return self.armed_target == "inner" and self.mode_inner.isChecked()
+        if self.workflow_step in {"presence", "center", "inner"}:
+            return self.mode_inner.isChecked()
         if self.workflow_step == "outer":
-            return self.armed_target == "outer" and self.mode_outer.isChecked()
+            return self.mode_outer.isChecked()
         return False
 
     def _capture_measurement(
@@ -751,6 +1127,8 @@ class MainWindow(QMainWindow):
         if kind == "inner":
             record.inner_a = self.pending_point
             record.inner_b = point
+            if record.rim_present is None:
+                record.rim_present = False
         else:
             record.outer_a = self.pending_point
             record.outer_b = point
@@ -849,6 +1227,7 @@ class MainWindow(QMainWindow):
                 "Click or measure the crater center before setting the scan position.",
             )
             return
+        self._push_undo()
         self.scan_position_override = point
         self.recalculate_expected_positions()
         self._sync_all()
@@ -869,6 +1248,7 @@ class MainWindow(QMainWindow):
         if self._updating_controls:
             return
         record = self.current_record()
+        self._push_undo()
         record.visible = checked
         if checked:
             record.missing = False
@@ -878,6 +1258,7 @@ class MainWindow(QMainWindow):
         if self._updating_controls:
             return
         record = self.current_record()
+        self._push_undo()
         if checked:
             record.set_missing()
         else:
@@ -888,6 +1269,7 @@ class MainWindow(QMainWindow):
         if self._updating_controls:
             return
         record = self.current_record()
+        self._push_undo()
         record.rim_present = None if index == 0 else index == 2
         self._sync_all()
 
@@ -895,9 +1277,37 @@ class MainWindow(QMainWindow):
         if self._updating_controls:
             return
         self.current_record().notes = self.notes_edit.toPlainText()
+        self.csv_needs_export = True
 
     def toggle_visible(self) -> None:
         self.visible_check.setChecked(not self.visible_check.isChecked())
+
+    def _shortcut_blocked_by_text_focus(self) -> bool:
+        focused = QApplication.focusWidget()
+        if focused is None:
+            return False
+        return focused == self.notes_edit or self.notes_edit.isAncestorOf(focused)
+
+    def shortcut_mark_missing(self) -> None:
+        if self._shortcut_blocked_by_text_focus():
+            return
+        self.mark_missing_from_workflow()
+
+    def shortcut_toggle_rim(self) -> None:
+        if self._shortcut_blocked_by_text_focus():
+            return
+        record = self.current_record()
+        self.set_rim_from_workflow(record.rim_present is not True)
+
+    def shortcut_undo(self) -> None:
+        if self._shortcut_blocked_by_text_focus():
+            return
+        self.undo_last()
+
+    def shortcut_redo(self) -> None:
+        if self._shortcut_blocked_by_text_focus():
+            return
+        self.redo_last()
 
     def arm_click_target(self, target: str) -> None:
         self.pending_point = None
@@ -915,16 +1325,34 @@ class MainWindow(QMainWindow):
             self.status.setText("Outer circle target armed. Click two opposite outer rim edges.")
         self._update_overlay()
 
+    def _set_guided_click_target(self) -> None:
+        if self.unlock_tools_check.isChecked():
+            return
+        if self.workflow_step in {"presence", "center", "inner"}:
+            self.armed_target = "inner"
+            self.mode_inner.setChecked(True)
+        elif self.workflow_step == "outer":
+            self.armed_target = "outer"
+            self.mode_outer.setChecked(True)
+        else:
+            self.armed_target = None
+
     def mark_present_from_workflow(self) -> None:
         record = self.current_record()
+        self._push_undo()
         record.visible = True
         record.missing = False
+        if record.rim_present is None:
+            record.rim_present = False
+            record.outer_a = None
+            record.outer_b = None
         self.pending_point = None
         self.armed_target = None
-        self.workflow_step = "rim" if record.center_point() is not None else "center"
+        self.workflow_step = "inner"
         self._sync_all()
 
     def mark_missing_from_workflow(self) -> None:
+        self._push_undo()
         self.current_record().set_missing()
         self.pending_point = None
         self.armed_target = None
@@ -932,6 +1360,7 @@ class MainWindow(QMainWindow):
 
     def set_rim_from_workflow(self, rim_present: bool) -> None:
         record = self.current_record()
+        self._push_undo()
         record.rim_present = rim_present
         record.visible = True
         record.missing = False
@@ -943,14 +1372,30 @@ class MainWindow(QMainWindow):
         self.workflow_step = "inner"
         self._sync_all()
 
-    def continue_workflow(self) -> None:
-        if self.workflow_step == "comment":
-            self._advance_to_next_crater()
+    def _begin_review_pause(self) -> None:
+        self.workflow_step = "review_pause"
+        self.review_pause_record_index = self.current_index
+        self.review_pause_timer.start(self.review_pause_ms)
+        self.status.setText(
+            f"Crater {self.current_index}: measurement saved. Brief review pause before next crater."
+        )
+        self._sync_all()
+
+    def finish_review_pause(self) -> None:
+        if self.workflow_step != "review_pause":
             return
-        if self.workflow_step == "complete":
-            self.export_csv()
+        if self.review_pause_record_index != self.current_index:
+            return
+        self.review_pause_record_index = None
+        self._advance_to_next_crater()
+
+    def _cancel_review_pause_timer(self) -> None:
+        if self.review_pause_timer.isActive():
+            self.review_pause_timer.stop()
+        self.review_pause_record_index = None
 
     def _advance_to_next_crater(self) -> None:
+        self._cancel_review_pause_timer()
         self.pending_point = None
         self.armed_target = None
         if self.current_index >= len(self.records):
@@ -966,21 +1411,39 @@ class MainWindow(QMainWindow):
         self._sync_all()
 
     def _infer_workflow_step_for_current(self) -> None:
-        if self.workflow_step == "complete":
+        if self.workflow_step in {"complete", "review_pause"}:
             return
         record = self.current_record()
+        self._derive_center_from_inner(record)
         if record.missing or not record.visible:
             self.workflow_step = "presence"
-        elif record.center_point() is None:
-            self.workflow_step = "center"
-        elif record.rim_present is None:
-            self.workflow_step = "rim"
         elif record.inner_diameter_px is None:
+            self.workflow_step = "inner"
+        elif record.rim_present is None:
+            self.workflow_step = "inner"
+        elif record.center_point() is None:
             self.workflow_step = "inner"
         elif record.rim_present and record.outer_diameter_px is None:
             self.workflow_step = "outer"
         else:
-            self.workflow_step = "comment"
+            self.workflow_step = "complete" if self._all_records_finished() else "presence"
+
+    def _all_records_finished(self) -> bool:
+        for record in self.records:
+            self._derive_center_from_inner(record)
+            if record.missing:
+                continue
+            if not record.visible:
+                return False
+            if record.center_point() is None:
+                return False
+            if record.rim_present is None:
+                return False
+            if record.inner_diameter_px is None:
+                return False
+            if record.rim_present and record.outer_diameter_px is None:
+                return False
+        return True
 
     def detect_current(self) -> None:
         if self.reader.info is None:
@@ -1015,6 +1478,7 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
 
+        self._push_undo()
         record.set_center((cx, cy), self.frame_index)
         record.inner_a = (cx - radius, cy)
         record.inner_b = (cx + radius, cy)
@@ -1046,6 +1510,7 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
 
+        self._push_undo()
         found = 0
         missed = 0
         for record in self.records:
@@ -1080,16 +1545,17 @@ class MainWindow(QMainWindow):
         self.status.setText(f"Detection pass complete: {found} found, {missed} marked missing")
         self._sync_all()
 
-    def export_csv(self) -> None:
+    def export_csv(self) -> Path | None:
         if not self.records:
-            return
+            return None
         default_name = "crater_measurements.csv"
         if self.reader.info is not None:
             default_name = self.reader.info.path.with_suffix(".csv").name
         path, _ = QFileDialog.getSaveFileName(self, "Export crater table", default_name, "CSV (*.csv)")
         if not path:
-            return
+            return None
 
+        csv_path = Path(path)
         fields = [
             "app_csv_version",
             "source_video_path",
@@ -1118,12 +1584,70 @@ class MainWindow(QMainWindow):
             "flags",
             "notes",
         ]
-        with Path(path).open("w", newline="", encoding="utf-8") as handle:
+        with csv_path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
             for record in self.records:
                 writer.writerow(self._record_to_row(record))
-        self.status.setText(f"Exported {len(self.records)} crater records to {path}")
+        self.last_csv_path = csv_path
+        self.csv_needs_export = False
+        self.status.setText(f"Exported {len(self.records)} crater records to {csv_path}")
+        return csv_path
+
+    def analyze_latest_csv(self) -> None:
+        csv_path = self._csv_path_for_analysis()
+        if csv_path is None:
+            return
+
+        output_dir = self._analysis_output_dir_for_csv(csv_path)
+        try:
+            from scripts.analyze_crater_csv import DEFAULT_UM_PER_PIXEL, analyze
+
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            analyze(csv_path, output_dir, rolling_window=15, bins=12, um_per_pixel=DEFAULT_UM_PER_PIXEL)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Analysis failed", str(exc))
+            self.status.setText(f"Analysis failed: {exc}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        self.status.setText(f"Analyzed {csv_path.name}; outputs written to {output_dir}")
+        AnalysisResultsDialog(csv_path, output_dir, self).exec()
+
+    def _analysis_output_dir_for_csv(self, csv_path: Path) -> Path:
+        if csv_path.parent.name == "csv" and csv_path.parent.parent.name == "data":
+            return csv_path.parent.parent / "analysis" / f"{csv_path.stem}_analysis"
+        return csv_path.with_name(f"{csv_path.stem}_analysis")
+
+    def _csv_path_for_analysis(self) -> Path | None:
+        if self.last_csv_path is not None and self.last_csv_path.exists() and not self.csv_needs_export:
+            return self.last_csv_path
+
+        if self.last_csv_path is not None and self.last_csv_path.exists() and self.csv_needs_export:
+            answer = QMessageBox.question(
+                self,
+                "Export current progress?",
+                "There are unsaved crater edits. Export the current CSV before running analysis?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.Cancel:
+                return None
+            if answer == QMessageBox.StandardButton.No:
+                return self.last_csv_path
+            return self.export_csv()
+
+        answer = QMessageBox.question(
+            self,
+            "CSV needed",
+            "No exported CSV is available for this session. Export a CSV now and analyze it?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return None
+        return self.export_csv()
 
     def import_csv(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -1148,6 +1672,10 @@ class MainWindow(QMainWindow):
             return
 
         records.sort(key=lambda record: record.index)
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.last_csv_path = Path(path)
+        self.csv_needs_export = False
         self.records = records
         self.current_index = self._resume_index()
         self.total_spin.blockSignals(True)
@@ -1329,11 +1857,15 @@ class MainWindow(QMainWindow):
         self.current_spin.setValue(row + 1)
 
     def _sync_all(self) -> None:
+        self._set_guided_click_target()
         self._sync_controls()
         self._sync_summary()
         self._sync_workflow_panel()
         self._populate_table()
         self._update_overlay()
+        self._sync_undo_redo_actions()
+        self._sync_total_apply_button()
+        self._sync_unsaved_indicator()
 
     def _sync_controls(self) -> None:
         record = self.current_record()
@@ -1389,47 +1921,84 @@ class MainWindow(QMainWindow):
         self.detect_current_button.setEnabled(self.reader.info is not None)
         self.detect_all_button.setEnabled(self.reader.info is not None and calibration >= 3)
 
+    def _sync_unsaved_indicator(self) -> None:
+        if self.csv_needs_export:
+            self.unsaved_label.setText("Unsaved changes")
+            self.unsaved_label.setStyleSheet("color: #f0c54a; padding-left: 8px;")
+        else:
+            self.unsaved_label.setText("Saved")
+            self.unsaved_label.setStyleSheet("color: #8a93a3; padding-left: 8px;")
+
     def _sync_workflow_panel(self) -> None:
         record = self.current_record()
         titles = {
-            "presence": f"Crater {record.index}: presence",
-            "center": f"Crater {record.index}: center",
+            "presence": f"Crater {record.index}: inner diameter",
+            "center": f"Crater {record.index}: inner diameter",
             "rim": f"Crater {record.index}: rim",
             "inner": f"Crater {record.index}: inner diameter",
             "outer": f"Crater {record.index}: outer diameter",
-            "comment": f"Crater {record.index}: comment",
+            "review_pause": f"Crater {record.index}: quick review",
             "complete": "Review complete",
         }
         calibration = self.prediction_count()
         manual_prefix = "" if calibration >= 3 else f"Manual calibration {calibration}/3. "
         instructions = {
-            "presence": manual_prefix + "Confirm whether the current crater is visible.",
-            "center": "Use exact frame controls if needed. Press Arm Center, then click the crater center.",
-            "rim": "Choose whether a resolidification rim is present.",
-            "inner": "Press Arm Inner Circle, then click opposite inner crater edges.",
-            "outer": "Press Arm Outer Circle, then click opposite outer rim edges.",
-            "comment": "Add an optional note, then continue.",
-            "complete": "All crater positions have been reviewed. Export the CSV when ready.",
+            "presence": manual_prefix + "Click two opposite inner crater edges. The midpoint becomes the measured center. Use Mark Missing only if the crater is not visible.",
+            "center": "Click two opposite inner crater edges. The midpoint becomes the measured center.",
+            "rim": "Rim defaults to no. Click Rim Present only if a rim is visible.",
+            "inner": "No rim is assumed. Click Rim Present only if needed, otherwise click two opposite inner crater edges.",
+            "outer": "Click two opposite outer rim edges.",
+            "review_pause": "Measurement saved. Check the overlay briefly; use Undo Last if it looks wrong.",
+            "complete": "All crater positions have been reviewed. Use Export CSV / Save Progress in the toolbar.",
         }
         self.workflow_title.setText(titles.get(self.workflow_step, "Guided review"))
         self.workflow_instruction.setText(instructions.get(self.workflow_step, ""))
 
-        is_presence = self.workflow_step == "presence"
-        is_rim = self.workflow_step == "rim"
-        is_continue = self.workflow_step in {"comment", "complete"}
+        active_block = "inner" if self.workflow_step == "review_pause" else "presence" if self.workflow_step == "center" else self.workflow_step
+        completed = self._completed_workflow_blocks(record)
+        for key, block in self.step_blocks.items():
+            if key == active_block:
+                block.setStyleSheet(
+                    "background: #1f657d; border: 1px solid #5cc8ff; border-radius: 5px; font-weight: 600;"
+                )
+            elif key in completed:
+                block.setStyleSheet(
+                    "background: #244733; border: 1px solid #4b8a5c; border-radius: 5px; color: #d8f6dd;"
+                )
+            elif key == "outer" and record.rim_present is False:
+                block.setStyleSheet(
+                    "background: #1b1f27; border: 1px solid #2b303a; border-radius: 5px; color: #6d7480;"
+                )
+            else:
+                block.setStyleSheet(
+                    "background: #242a35; border: 1px solid #343a46; border-radius: 5px; color: #b8c0cc;"
+                )
+
+        is_presence = self.workflow_step in {"presence", "center"}
+        is_rim = self.workflow_step in {"presence", "center", "rim", "inner"}
         unlocked = self.unlock_tools_check.isChecked()
         self.presence_actions_label.setEnabled(is_presence)
-        self.present_button.setEnabled(is_presence)
+        self.present_button.setEnabled(is_presence and record.center_point() is not None)
         self.absent_button.setEnabled(is_presence)
-        self.tool_actions_label.setEnabled(self.workflow_step in {"center", "inner", "outer"})
-        self.arm_center_button.setEnabled(unlocked or self.workflow_step == "center")
-        self.arm_inner_button.setEnabled(unlocked or self.workflow_step == "inner")
-        self.arm_outer_button.setEnabled(unlocked or self.workflow_step == "outer")
+        self.tool_actions_label.setEnabled(self.workflow_step in {"presence", "center", "inner", "outer"})
+        self.arm_center_button.setEnabled(unlocked)
+        self.arm_inner_button.setEnabled(unlocked)
+        self.arm_outer_button.setEnabled(unlocked)
         self.rim_actions_label.setEnabled(is_rim)
-        self.no_rim_button.setEnabled(is_rim)
-        self.yes_rim_button.setEnabled(is_rim)
-        self.continue_button.setEnabled(is_continue)
-        self.continue_button.setText("Export CSV" if self.workflow_step == "complete" else "Continue")
+        self.no_rim_button.setEnabled(is_rim and record.rim_present is True)
+        self.yes_rim_button.setEnabled(is_rim and record.rim_present is not True)
+
+    def _completed_workflow_blocks(self, record: CraterRecord) -> set[str]:
+        completed: set[str] = set()
+        if record.visible or record.missing or record.center_point() is not None:
+            completed.add("presence")
+        if record.rim_present is not None:
+            completed.add("rim")
+        if record.inner_diameter_px is not None:
+            completed.add("inner")
+        if record.rim_present is False or record.outer_diameter_px is not None:
+            completed.add("outer")
+        return completed
 
     def _populate_table(self) -> None:
         self._updating_controls = True
@@ -1473,7 +2042,23 @@ class MainWindow(QMainWindow):
             outer,
             self.pending_point,
             f"#{record.index}",
+            self._video_instruction(record),
         )
+
+    def _video_instruction(self, record: CraterRecord) -> str:
+        if self.workflow_step == "complete":
+            return "Review complete. Export or analyze the CSV from the toolbar."
+        if self.workflow_step == "review_pause":
+            return f"Crater {record.index}: measurement saved. Quick final check; Undo Last if needed."
+        if self.pending_point is not None:
+            return f"Crater {record.index}: first edge set. Click the opposite edge, or press Esc to cancel."
+        if self.workflow_step in {"presence", "center", "inner"}:
+            return f"Crater {record.index}: click two opposite inner edges. M = missing, R = rim present."
+        if self.workflow_step == "outer":
+            return f"Crater {record.index}: click two opposite outer rim edges. Esc cancels current measurement."
+        if self.workflow_step == "rim":
+            return f"Crater {record.index}: R toggles rim present. M marks missing."
+        return f"Crater {record.index}: follow Guided Review."
 
     def _overlay_expected_point(self, record: CraterRecord) -> tuple[float, float] | None:
         if not self.show_suggestions_check.isChecked():
@@ -1584,5 +2169,5 @@ def main() -> None:
     app = QApplication(sys.argv)
     apply_dark_theme(app)
     window = MainWindow()
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec())

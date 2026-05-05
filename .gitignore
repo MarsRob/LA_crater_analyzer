@@ -10,3 +10,7 @@ __pycache__/
 *.mov
 *_analysis/
 LOCAL_SETUP.md
+data/csv/
+data/analysis/
+!data/
+!data/README.md
